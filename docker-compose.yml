@@ -1,0 +1,18 @@
+# Desarrollo local del backend. En producción: MongoDB Atlas + Redis gestionado.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+  api:
+    build: .
+    command: node src/server.js
+    env_file: .env
+    ports: ["4000:4000"]
+    depends_on: [redis]
+  worker:
+    build: .
+    command: node src/worker.js
+    env_file: .env
+    depends_on: [redis]
+    deploy: { replicas: 2 }
