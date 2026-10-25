@@ -1,0 +1,89 @@
+# Blueprint de Render: API + worker + Key Value (Redis) en Frankfurt (UE).
+# Render → New → Blueprint → elige este repositorio. Los secretos marcados con sync:false te los pedirá en el primer despliegue.
+envVarGroups:
+  - name: juntial-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: STAFF_MFA_REQUIRED
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: lax
+      # ── URLs públicas (cámbialas por tus dominios) ──
+      - key: PUBLIC_API_URL        # p. ej. https://api.juntial.com  (webhooks de Telegram, OAuth, MCP, enlaces de aprobación)
+        sync: false
+      - key: WEB_URL               # p. ej. https://app.juntial.com
+        sync: false
+      - key: CORS_ORIGINS          # p. ej. https://app.juntial.com
+        sync: false
+      - key: COOKIE_DOMAIN         # p. ej. .juntial.com (vacío si usas dominios distintos)
+        sync: false
+      # ── Secretos: COPIA LOS DE TU .env ACTUAL (sobre todo ENCRYPTION_KEY) ──
+      - key: MONGO_URI
+        sync: false
+      - key: ENCRYPTION_KEY        # ¡LA MISMA de tu .env! Con otra no se podrán leer tokens ni claves ya guardados
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: SUPERADMIN_EMAIL
+        sync: false
+      - key: PLATFORM_OPENAI_KEY
+        sync: false
+
+services:
+  # Cola y caché (BullMQ): noeviction para que NUNCA se pierdan trabajos; solo accesible desde la red privada de Render
+  - type: keyvalue
+    name: juntial-redis
+    region: frankfurt
+    plan: starter
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+  # API (panel, API v1, MCP + OAuth, webhooks de Telegram, widget web)
+  - type: web
+    name: juntial-api
+    runtime: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/server.js
+    healthCheckPath: /healthz
+    envVars:
+      - fromGroup: juntial-shared
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: juntial-redis
+          property: connectionString
+
+  # Worker (agentes de Telegram, rutinas del empleado digital, reglas de flujo, emails, webhooks)
+  - type: worker
+    name: juntial-worker
+    runtime: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/worker.js
+    envVars:
+      - fromGroup: juntial-shared
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: juntial-redis
+          property: connectionString

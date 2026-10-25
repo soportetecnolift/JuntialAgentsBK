@@ -13,7 +13,8 @@
     "start:worker": "node src/worker.js",
     "seed": "node src/scripts/seed.js",
     "set-password": "node src/scripts/set-password.js",
-    "reset-mfa": "node src/scripts/reset-mfa.js"
+    "reset-mfa": "node src/scripts/reset-mfa.js",
+    "telegram:rewebhook": "node src/scripts/rewebhook.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
