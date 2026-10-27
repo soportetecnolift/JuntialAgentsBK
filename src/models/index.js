@@ -90,6 +90,38 @@ const BotSchema = new Schema({
   worker: {
     role: String, title: String, mission: String, responsibilities: String, kpis: String,
     knowledge: { instructions: String, examples: [{ situation: String, action: String, _id: false }] },
+    // Fuente estructurada del manual (el «guion»); knowledge.instructions se genera a partir de esto cuando se usa.
+    blueprint: {
+      context: String, autonomyNotes: String, reportFormat: String, queryHints: String, notes: String,
+      stateField: String, allStateValues: String, completionRule: String, automations: String, dataQuirks: String,
+      variants: [{ name: String, rule: String, _id: false }],
+      stages: [{ from: String, to: String, requirement: String, _id: false }],
+      priorities: [String],
+    },
+    // Equipo: compañeros y colaboradores con sus canales. Sirve para saber QUIÉN le habla (por Telegram, email,
+    // su página personal o la API), a quién avisar de cada cosa y quién puede decidir sus aprobaciones.
+    people: [{
+      name: String, role: String, relation: { type: String, enum: ['responsable', 'compañero', 'colaborador', 'externo'], default: 'compañero' },
+      email: { type: String, lowercase: true, trim: true }, telegramUsername: { type: String, lowercase: true, trim: true }, telegramChatId: Number, phone: String,
+      canApprove: { type: Boolean, default: false }, notes: String, userId: Types.ObjectId,
+    }],
+    // Quién aprueba sus cambios (sin política de Juntial Center): las personas del equipo con «puede aprobar».
+    // mode: any = basta uno · all = todos · quorum = un mínimo. onlyApprovers: solo ellos (y los administradores
+    // desde el panel) pueden decidir; nadie más aunque esté en el chat de Telegram o tenga el email reenviado.
+    approvalRule: { mode: { type: String, enum: ['any', 'all', 'quorum'], default: 'any' }, quorum: { type: Number, default: 2 }, onlyApprovers: { type: Boolean, default: true } },
+    // Memoria de trabajo: lo que tiene entre manos (pendientes abiertos) y un diario breve de lo que va haciendo
+    threads: [{ text: String, who: String, due: Date, status: { type: String, enum: ['open', 'done'], default: 'open' }, createdAt: Date, closedAt: Date, note: String }],
+    journal: [{ at: Date, text: String, _id: false }],
+    // Modo proactivo: cada cierto tiempo revisa por su cuenta sus pendientes, aprobaciones sin respuesta y novedades
+    proactive: { enabled: { type: Boolean, default: false }, everyHours: { type: Number, default: 3 }, lastAt: Date },
+    // Canales para hablar con él además del panel
+    channels: { telegramChat: { type: Boolean, default: false }, pages: { type: Boolean, default: true }, api: { type: Boolean, default: true } },
+    // Estilo de sus mensajes: corto (por defecto) o detallado
+    style: { type: String, enum: ['corto', 'detallado'], default: 'corto' },
+    // Resultado de la última puesta a punto (verificación de campos contra el conector real)
+    onboarding: { ok: Boolean, skipped: Boolean, reason: String, completeness: Schema.Types.Mixed, candidates: [String],
+      confirmed: [{ field: String, note: String, _id: false }], notFound: [{ field: String, suggestion: String, _id: false }],
+      stateValuesNotFound: [String], extraStateValues: [String], summary: String, checkedAt: Date },
     memory: [{ text: String, source: { type: String, enum: ['feedback', 'chat', 'agent', 'manual'] }, at: Date }],
     autonomy: {
       preset: { type: String, default: 'asistente' },
@@ -144,7 +176,7 @@ const BotSchema = new Schema({
     provider: { type: String, enum: ['anthropic', 'openai'], default: 'anthropic' },
     model: String, apiKeyEnc: { type: String, select: false }, apiKeyMask: String,
     transcribeKeyEnc: { type: String, select: false },
-    temperature: { type: Number, default: 0.4 }, maxTokens: { type: Number, default: 1500 }, maxToolSteps: { type: Number, default: 8 },
+    temperature: { type: Number, default: 0.4 }, maxTokens: { type: Number, default: 1500 }, maxToolSteps: { type: Number, default: 8 }, // Para kind:'worker' se fijan explícitos y mayores al crear (ver modules/bots/routes.js); el motor del empleado además impone un mínimo en cada ejecución como red de seguridad.
     autoUpgrade: { type: Boolean, default: true }, // si el modelo se retira, pasar a la versión más reciente de su familia
     modelStatus: { checkedAt: Date, available: Boolean, newer: String },
   },
@@ -409,6 +441,7 @@ const WorkerRunSchema = new Schema({
   status: { type: String, enum: ['running', 'done', 'waiting', 'error', 'skipped'], default: 'running' },
   summary: String, steps: [{ t: Number, kind: String, name: String, category: String, policy: String, args: Schema.Types.Mixed, result: String, ms: Number, _id: false }],
   approvals: Number, actions: Number, usage: Schema.Types.Mixed, ms: Number, endedAt: Date, expiresAt: Date,
+  detail: String, // informe completo (el aviso que llega a Telegram/email es la versión corta, en summary)
   report: { sent: Boolean, noNews: Boolean, reason: String, delivery: [{ channel: String, ok: Boolean, info: String, error: String, _id: false }] },
 }, ts);
 WorkerRunSchema.index({ botId: 1, createdAt: -1 });
@@ -424,9 +457,15 @@ const WorkerApprovalSchema = new Schema({
   steps: [{ name: String, mode: String, quorum: Number, approverIds: [Types.ObjectId], status: { type: String, default: 'waiting' }, startedAt: Date, dueAt: Date, onTimeout: String, escalate: Schema.Types.Mixed, timeoutHours: Number, reminded: Number, _id: false,
     decisions: [{ memberId: Types.ObjectId, name: String, email: String, decision: String, via: String, comment: String, at: Date, _id: false }] }],
   approverTokens: { type: [{ memberId: Types.ObjectId, hash: String, _id: false }], select: false },
+  // Aprobadores del equipo del empleado: cada uno recibe su propia solicitud y su voto queda registrado
+  votes: [{ personId: Types.ObjectId, name: String, decision: String, via: String, comment: String, at: Date, _id: false }],
+  need: Number, // votos a favor necesarios (según la regla del empleado al crear la aprobación)
+  personTokens: { type: [{ personId: Types.ObjectId, hash: String, _id: false }], select: false },
+  tgMessages: [{ botId: Types.ObjectId, chatId: Number, messageId: Number, personId: Types.ObjectId, _id: false }],
 }, ts);
 WorkerApprovalSchema.index({ botId: 1, status: 1, createdAt: -1 });
-const WorkerMessageSchema = new Schema({ botId: { type: Types.ObjectId, index: true }, userId: Types.ObjectId, role: String, text: String, runId: Types.ObjectId, expiresAt: Date }, { timestamps: true });
+const WorkerMessageSchema = new Schema({ botId: { type: Types.ObjectId, index: true }, userId: Types.ObjectId, role: String, text: String, runId: Types.ObjectId, expiresAt: Date,
+  conv: { type: String, index: true }, channel: String, from: String }, { timestamps: true }); // conv: conversación fuera del panel (telegram:<chat>, page:<persona>, api:<remitente>)
 WorkerMessageSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 const WorkerFileSchema = new Schema({
   tenantId: Types.ObjectId, botId: { type: Types.ObjectId, index: true },
@@ -443,6 +482,10 @@ export const WorkerRoutine = model('WorkerRoutine', WorkerRoutineSchema);
 export const WorkerDoc = model('WorkerDoc', WorkerDocSchema);
 export const WorkerRun = model('WorkerRun', WorkerRunSchema);
 export const WorkerApproval = model('WorkerApproval', WorkerApprovalSchema);
+// Enlaces personales de chat con el empleado (uno por persona del equipo). Fuera del documento del bot a propósito:
+// así guardar el puesto nunca los borra, y revocarlos es borrar una fila.
+const WorkerLinkSchema = new Schema({ botId: { type: Types.ObjectId, index: true }, personId: Types.ObjectId, tokenHash: { type: String, index: true, unique: true }, lastUsedAt: Date }, { timestamps: true });
+export const WorkerLink = model('WorkerLink', WorkerLinkSchema);
 export const WorkerMessage = model('WorkerMessage', WorkerMessageSchema);
 
 /* ───────── Juntial Center: organizaciones, miembros, áreas, apps, conexiones, eventos y aprobaciones ───────── */

@@ -82,13 +82,21 @@ const CAT = { data: 'Cambiar datos', external: 'Comunicarse con clientes', destr
 /** Aprobación nueva → todos los canales activos. Devuelve el resultado de cada canal. */
 export async function fanOutApproval(bot, a, raw, { direct = false, policy = false } = {}) {
   const rep = bot.worker?.reporting || {}; const L = decisionLinks(raw); const who = bot.worker?.title || bot.name; const results = [];
-  results.push(await panelSend(bot, { title: `🟡 ${who} necesita tu aprobación`, body: a.label, link: `${env.WEB_URL}/bots/${bot._id}?tab=approvals` }));
+  // Motivo en una frase: el «pensamiento» previo del agente puede ser un párrafo; se queda la primera frase útil
+  const why = String(a.reason || '').replace(/\s+/g, ' ').trim().split(/(?<=[.!?])\s/)[0].slice(0, 220);
+  results.push(await panelSend(bot, { title: `🟡 ${who}: ¿lo apruebas?`, body: `${a.label}${why ? ` — ${why}` : ''}`, link: `${env.WEB_URL}/bots/${bot._id}?tab=approvals` }));
   const chain = policy && a.steps?.length ? `\n\n🔐 <b>${esc(a.policyName)}</b> · ${a.steps.map((s, i) => `${i + 1}. ${esc(s.name)}`).join(' → ')}\nDecide quien tenga el paso actual (Telegram vinculado en Juntial Center).` : '';
-  const tg = await telegramSend(bot, `🟡 <b>${esc(who)} necesita tu aprobación</b>\n${esc(a.label)}${a.reason ? `\n\n<i>Motivo:</i> ${esc(a.reason.slice(0, 600))}` : ''}${chain}`,
+  const { approversOf: aof } = await import('./engine.js'); const rule = policy ? null : aof(bot);
+  const ruleTxt = rule?.list.length ? `\n👥 ${rule.need === 1 ? 'Basta con que apruebe uno' : `Hacen falta ${rule.need} de ${rule.list.length}`}: ${rule.list.map((p) => esc(p.name.split(' ')[0])).join(', ')}` : '';
+  const tg = await telegramSend(bot, `🟡 <b>${esc(who)}</b>: ${esc(a.label)}${why ? `\n<i>${esc(why)}</i>` : ''}${chain}${ruleTxt}\n¿Lo apruebas?`,
     { inline_keyboard: [[{ text: '✅ Aprobar', callback_data: `a|${a._id}|y` }, { text: '❌ Rechazar', callback_data: `a|${a._id}|n` }]] });
   if (!tg.skipped) results.push(tg);
-  if (tg.messageId) await WorkerApproval.updateOne({ _id: a._id }, { tg: { botId: rep.telegramBotId, chatId: rep.chatId, messageId: tg.messageId } });
-  if (!policy && wants(rep.email, 'approvals')) results.push(await emailSend(bot, { subject: `🟡 Aprobación pendiente: ${a.label.slice(0, 90)}`, title: `${who} necesita tu aprobación`,
+  if (tg.messageId) await WorkerApproval.updateOne({ _id: a._id }, { tg: { botId: rep.telegramBotId, chatId: rep.chatId, messageId: tg.messageId }, $push: { tgMessages: { botId: rep.telegramBotId, chatId: rep.chatId, messageId: tg.messageId } } });
+  // Aprobadores del equipo: cada uno recibe la solicitud a su nombre (Telegram privado con botones o email con enlace personal)
+  const { approversOf } = await import('./engine.js'); const ap = policy ? { list: [] } : approversOf(bot);
+  if (ap.list.length) results.push(...(await sendToApprovers(bot, a, ap, { who, why, direct })));
+  const sharedLinks = !ap.list.length || !ap.onlyApprovers; // con aprobadores definidos, un enlace compartido no identifica a nadie
+  if (!policy && sharedLinks && wants(rep.email, 'approvals')) results.push(await emailSend(bot, { subject: `🟡 Aprobación pendiente: ${a.label.slice(0, 90)}`, title: `${who} necesita tu aprobación`,
     html: `<p style="font-size:16px;font-weight:700;margin:0 0 8px">${esc(a.label)}</p><p style="margin:0 0 6px;color:#5b6673">Tipo: ${esc(CAT[a.category] || a.category)}</p>${a.reason ? `<p style="margin:0 0 16px"><i>Motivo:</i> ${esc(a.reason.slice(0, 800))}</p>` : ''}
       <p>${btn(`${L.approve}&via=email`, '✅ Aprobar', '#0E7C86')}${btn(`${L.reject}&via=email`, '❌ Rechazar', '#B42318')}</p>
       <p style="font-size:12px;color:#5b6673">Se abrirá una página para confirmar. Caduca el ${new Date(a.expiresAt).toLocaleString('es-ES', { timeZone: 'Europe/Madrid' })}. También puedes decidir desde JuntialAgents.</p>` }, { direct }));
@@ -110,15 +118,56 @@ export async function fanOutReport(bot, { title, body, urgent, kind = 'reports',
 }
 
 /** Tras decidir (desde cualquier canal), el resto se actualiza: se quitan los botones de Telegram y se avisa al webhook. */
-export async function syncDecision(a, { status, by, via, result, error }) {
+export async function syncDecision(a, { status, by, via, result, error, except }) {
   const bot = await Bot.findById(a.botId).lean(); if (!bot) return;
-  if (a.tg?.messageId && via !== 'telegram') {
-    const rt = await getBotRuntime(a.tg.botId).catch(() => null);
-    const txt = status === 'executed' ? `✅ Aprobada por ${by} (${via}) y ejecutada` : status === 'failed' ? `⚠️ Aprobada por ${by} (${via}), pero falló: ${error}` : `❌ Rechazada por ${by} (${via})`;
-    rt?.api?.call('editMessageReplyMarkup', { chat_id: a.tg.chatId, message_id: a.tg.messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    rt?.api?.call('sendMessage', { chat_id: a.tg.chatId, text: txt, reply_parameters: { message_id: a.tg.messageId, allow_sending_without_reply: true } }).catch(() => {});
+  // Todos los mensajes de Telegram de esta aprobación (chat de informes y el privado de cada aprobador) se cierran
+  const txt = status === 'executed' ? `✅ Aprobada por ${by} (${via}) y ejecutada` : status === 'failed' ? `⚠️ Aprobada por ${by} (${via}), pero falló: ${error}` : `❌ Rechazada por ${by} (${via})`;
+  const fresh = await WorkerApproval.findById(a._id).select('tg tgMessages').lean();
+  const msgs = [...(fresh?.tgMessages || [])]; if (fresh?.tg?.messageId && !msgs.some((m) => m.messageId === fresh.tg.messageId && m.chatId === fresh.tg.chatId)) msgs.push(fresh.tg);
+  for (const m of msgs) {
+    if (except && Number(except.chatId) === Number(m.chatId) && Number(except.messageId) === Number(m.messageId)) continue;
+    const rt = await getBotRuntime(m.botId).catch(() => null);
+    rt?.api?.call('editMessageReplyMarkup', { chat_id: m.chatId, message_id: m.messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    rt?.api?.call('sendMessage', { chat_id: m.chatId, text: txt, reply_parameters: { message_id: m.messageId, allow_sending_without_reply: true } }).catch(() => {});
   }
   if (wants(bot.worker?.reporting?.webhook, 'decisions')) await webhookSend(bot, 'approval.decided', { approval: { id: String(a._id), label: a.label, status, decidedBy: by, via, result: result || error || null, feedback: a.feedback || null } });
+}
+
+/** Voto parcial (p. ej. 1 de 2): se comenta en todos los mensajes de Telegram, sin quitar los botones. */
+export async function notifyVote(a, text, except) {
+  const msgs = a.tgMessages || [];
+  for (const m of msgs) {
+    if (except && Number(except.chatId) === Number(m.chatId) && Number(except.messageId) === Number(m.messageId)) continue;
+    const rt = await getBotRuntime(m.botId).catch(() => null);
+    rt?.api?.call('sendMessage', { chat_id: m.chatId, text, reply_parameters: { message_id: m.messageId, allow_sending_without_reply: true } }).catch(() => {});
+  }
+}
+
+/** Envía la solicitud a cada aprobador del equipo por su canal: Telegram privado (botones) o email (enlace personal). */
+async function sendToApprovers(bot, a, ap, { who, why, direct }) {
+  const out = []; const rep = bot.worker?.reporting || {}; const tokens = []; const tgMsgs = [];
+  const rule = ap.need === 1 ? 'Basta con que lo apruebe uno de vosotros.' : `Hacen falta ${ap.need} aprobaciones de ${ap.list.length}.`;
+  for (const p of ap.list) {
+    // Si ya está en el chat de informes (mismo chat), no se le duplica
+    if (p.telegramChatId && rep.telegramBotId && Number(p.telegramChatId) !== Number(rep.chatId)) {
+      const rt = await getBotRuntime(rep.telegramBotId).catch(() => null);
+      const r = await rt?.api?.call('sendMessage', { chat_id: p.telegramChatId, parse_mode: 'HTML', text: `🟡 <b>${esc(p.name.split(' ')[0])}</b>, ${esc(who)} necesita tu visto bueno:\n${esc(a.label)}${why ? `\n<i>${esc(why)}</i>` : ''}\n${esc(rule)}`,
+        reply_markup: { inline_keyboard: [[{ text: '✅ Aprobar', callback_data: `a|${a._id}|y` }, { text: '❌ Rechazar', callback_data: `a|${a._id}|n` }]] } }).catch((e) => ({ error: e.message }));
+      if (r?.message_id) { tgMsgs.push({ botId: rep.telegramBotId, chatId: p.telegramChatId, messageId: r.message_id, personId: p._id }); out.push({ channel: `telegram:${p.name}`, ok: true, info: `Telegram privado a ${p.name}` }); continue; }
+      out.push({ channel: `telegram:${p.name}`, ok: false, error: r?.error || 'No se pudo enviar' });
+    }
+    if (p.email) {
+      const raw = `apr_${randomToken(24)}`; tokens.push({ personId: p._id, hash: sha256(raw) }); const L = decisionLinks(raw);
+      out.push(await emailSend({ ...bot, worker: { ...bot.worker, reporting: { ...rep, email: { enabled: true, to: [p.email], events: ['approvals'] } } } }, {
+        subject: `🟡 ${who}: ${a.label.slice(0, 90)}`, title: `${p.name.split(' ')[0]}, necesito tu visto bueno`,
+        html: `<p style="font-size:16px;font-weight:700;margin:0 0 8px">${esc(a.label)}</p>${why ? `<p style="margin:0 0 10px"><i>${esc(why)}</i></p>` : ''}<p style="margin:0 0 14px;color:#5b6673">${esc(rule)}</p>
+          <p>${btn(`${L.approve}&via=email`, '✅ Aprobar', '#0E7C86')}${btn(`${L.reject}&via=email`, '❌ Rechazar', '#B42318')}</p><p style="font-size:12px;color:#5b6673">Enlace personal a tu nombre: no lo reenvíes.</p>` }, { direct }).then((r) => ({ ...r, channel: `email:${p.name}` })));
+      continue;
+    }
+    if (!p.telegramChatId) out.push({ channel: `aprobador:${p.name}`, ok: false, error: p.telegramUsername ? 'Aún no ha escrito al bot de Telegram y no tiene email' : 'Sin Telegram ni email' });
+  }
+  await WorkerApproval.updateOne({ _id: a._id }, { $push: { personTokens: { $each: tokens }, tgMessages: { $each: tgMsgs } } });
+  return out;
 }
 
 /* ───────── Página pública de decisión /a/:token (enlaces de email y webhook) ───────── */
@@ -137,7 +186,9 @@ async function load(token) {
   const h = sha256(token);
   let a = await WorkerApproval.findOne({ tokenHash: h }).lean(); let memberId = null;
   if (!a) { a = await WorkerApproval.findOne({ 'approverTokens.hash': h }).select('+approverTokens').lean(); memberId = a?.approverTokens?.find((x) => x.hash === h)?.memberId || null; if (a) delete a.approverTokens; }
-  if (!a) return null; a.__memberId = memberId;
+  let personId = null;
+  if (!a) { a = await WorkerApproval.findOne({ 'personTokens.hash': h }).select('+personTokens').lean(); personId = a?.personTokens?.find((x) => x.hash === h)?.personId || null; if (a) delete a.personTokens; }
+  if (!a) return null; a.__memberId = memberId; a.__personId = personId;
   if (a.status === 'pending' && a.expiresAt < new Date()) { await WorkerApproval.updateOne({ _id: a._id, status: 'pending' }, { status: 'expired' }); a.status = 'expired'; }
   return a;
 }
@@ -163,7 +214,16 @@ approvalPublic.post('/:token', async (req, res) => {
   const by = String(req.body.decidedBy || (via === 'email' ? 'Enlace de email' : via === 'webhook' ? 'Sistema externo' : 'Enlace')).slice(0, 80);
   const { decideApproval } = await import('./engine.js');
   if (a.steps?.length && !a.__memberId && !(json && req.body.decidedBy)) return json ? res.status(403).json({ ok: false, error: 'Esta aprobación sigue una política: decide con tu enlace personal o indica decidedBy (email del aprobador)' }) : res.status(403).send(page('Enlace no personal', '<h1>Usa tu enlace personal</h1><p class="s">Esta aprobación sigue una política con aprobadores concretos. Revisa el email que te llegó a tu nombre o decide en Juntial Center.</p>'));
-  const out = await decideApproval(a._id, { approve: d === 'approve', by, via, feedback: req.body.feedback ? String(req.body.feedback).slice(0, 1000) : undefined, actor: a.__memberId ? { memberId: a.__memberId } : req.body.decidedBy ? { email: req.body.decidedBy } : undefined });
+  const feedback = req.body.feedback ? String(req.body.feedback).slice(0, 1000) : undefined;
+  let out;
+  if (a.steps?.length) out = await decideApproval(a._id, { approve: d === 'approve', by, via, feedback, actor: a.__memberId ? { memberId: a.__memberId } : req.body.decidedBy ? { email: req.body.decidedBy } : undefined });
+  else {
+    // Aprobadores del equipo: enlace personal (o decidedBy con su email en webhooks); el enlace compartido no vale si hay aprobadores
+    const { voteApproval } = await import('./engine.js'); const { identifyPerson } = await import('./conversation.js');
+    const wbot = await Bot.findById(a.botId).lean();
+    const person = a.__personId ? identifyPerson(wbot, { personId: a.__personId }) : req.body.decidedBy ? identifyPerson(wbot, { email: req.body.decidedBy }) : null;
+    out = await voteApproval(a._id, { approve: d === 'approve', person, by: person?.name || by, via, feedback });
+  }
   if (out.ok && out.status === 'pending') return json ? res.json(out) : res.send(page('Voto registrado', `<h1>Voto registrado</h1><p class="l">${esc(a.label)}</p><p class="s">${esc(out.info)}</p><p class="s">Ya puedes cerrar esta página.</p>`));
   if (json) return res.status(out.ok || out.status === 'failed' ? 200 : 409).json(out);
   const fresh = await WorkerApproval.findById(a._id).lean();

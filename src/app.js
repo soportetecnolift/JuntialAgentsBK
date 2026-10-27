@@ -29,6 +29,7 @@ import { docsHtml } from './api/openapi.js';
 import widgetPublic from './modules/web/public.js';
 import crmRoutes from './modules/crm/routes.js';
 import { approvalPublic } from './modules/worker/channels.js';
+import { workerPage } from './modules/worker/page.js';
 import centerRoutes, { invitationLookup } from './modules/center/routes.js';
 import { appGuard } from './modules/center/access.js';
 import { wellKnown, oauthPublic, oauthConsent } from './modules/oauth/server.js';
@@ -75,6 +76,9 @@ export function createApp() {
   app.use(wellKnown);
   app.use('/oauth', openCors, limiter('oauth', 60000, 120), oauthPublic);
   app.use('/mcp', openCors, express.json({ limit: '12mb' }), limiter('mcp', 60000, 600), mcpRouter);
+
+  // Página de chat personal con un empleado digital (el enlace identifica a la persona del equipo)
+  app.use('/w', limiter('wpage', 60000, 120), workerPage);
 
   // API pública v1 (API keys de cliente y de administrador)
   app.use('/v1', createV1());

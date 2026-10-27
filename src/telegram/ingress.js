@@ -70,6 +70,23 @@ export async function route(rt, update) {
     return tgUpdates.inc({ outcome: 'context' });
   }
 
+  // ¿Este bot de Telegram es también la «voz» de un empleado digital? Si escribe alguien de su equipo (o el chat
+  // de informes), la conversación es con el empleado, no con el bot de Telegram normal.
+  if (action === 'respond' && text && !text.startsWith('/')) {
+    const { workerForTelegramBot, identifyPerson } = await import('../modules/worker/conversation.js');
+    const w = await workerForTelegramBot(bot._id);
+    if (w) {
+      const fromTeam = identifyPerson(w, { telegramChatId: msg.chat.type === 'private' ? msg.chat.id : null, telegramUsername: msg.from?.username });
+      const reportChat = w.worker?.reporting?.chatId && Number(w.worker.reporting.chatId) === Number(msg.chat.id);
+      if (fromTeam || reportChat) {
+        if ((await takeToken(`tg:wk:${bot._id}:${msg.from.id}`, 0.2, 5)) > 0) return;
+        await Q.workers.add('talk', { workerId: String(w._id), tgBotId: String(bot._id), chatId: msg.chat.id, from: { id: msg.from.id, username: msg.from.username, first_name: msg.from.first_name }, text: text.slice(0, 4000) }, { attempts: 1 });
+        rt.api?.call('sendChatAction', { chat_id: msg.chat.id, action: 'typing' }).catch(() => {});
+        return tgUpdates.inc({ outcome: 'worker' });
+      }
+    }
+  }
+
   const key = `${bot._id}:${msg.chat.id}`;
   // Bucket por remitente: 30/min con ráfaga de 10
   if ((await takeToken(`tg:in:user:${key}:${msg.from.id}`, 0.5, 10)) > 0) {
@@ -110,11 +127,18 @@ async function onCallback(rt, cq) {
     const ap = await WorkerApproval.findById(id).lean().catch(() => null);
     if (!ap || String(ap.tenantId) !== String(bot.tenantId)) return answer('Aprobación no encontrada');
     const who = cq.from.username ? `@${cq.from.username}` : cq.from.first_name;
-    const out = await decideApproval(id, { approve: yn === 'y', by: who, via: 'telegram', actor: { telegramUsername: cq.from.username } });
-    if (out.ok && out.status === 'pending') return answer(`🗳 ${out.info}`);
+    // ¿Quién pulsa? Aprobador del equipo del empleado → vota; administrador de la organización (Telegram vinculado
+    // en Juntial Center) → decide; cualquier otro → solo si el empleado no tiene aprobadores definidos.
+    const { Bot: BotM, Membership } = await import('../models/index.js'); const { voteApproval } = await import('../modules/worker/engine.js'); const { identifyPerson } = await import('../modules/worker/conversation.js');
+    const wbot = await BotM.findById(ap.botId).lean();
+    const person = identifyPerson(wbot, { telegramChatId: cq.message?.chat?.type === 'private' ? cq.message.chat.id : null, telegramUsername: cq.from.username });
+    const admin = !person && cq.from.username ? await Membership.findOne({ orgId: bot.tenantId, telegramUsername: String(cq.from.username).toLowerCase(), status: 'active', orgRole: { $in: ['owner', 'admin'] } }).lean() : null;
+    const except = { chatId: cq.message?.chat?.id, messageId: cq.message?.message_id };
+    const out = await voteApproval(id, { approve: yn === 'y', person, by: person?.name || admin?.name || who, via: 'telegram', actor: { telegramUsername: cq.from.username }, override: !!admin, syncExcept: except });
+    if (out.ok && out.status === 'pending') { answer(`🗳 ${out.info}`.slice(0, 190)); api.call('editMessageReplyMarkup', { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {}); api.call('sendMessage', { chat_id: cq.message.chat.id, reply_parameters: { message_id: cq.message.message_id, allow_sending_without_reply: true }, text: `🗳 ${out.info}` }).catch(() => {}); return; }
     answer(out.ok ? (yn === 'y' ? '✅ Aprobada' : '❌ Rechazada') : out.error);
     if (out.ok || out.status === 'failed') api.call('editMessageReplyMarkup', { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    if (out.ok || out.status === 'failed') api.call('sendMessage', { chat_id: cq.message.chat.id, reply_parameters: { message_id: cq.message.message_id, allow_sending_without_reply: true }, text: yn === 'y' ? (out.status === 'executed' ? `✅ Aprobada por ${who} y ejecutada.` : `⚠️ Aprobada pero falló: ${out.error}`) : `❌ Rechazada por ${who}. Lo tendrá en cuenta para la próxima.` }).catch(() => {});
+    if (out.ok || out.status === 'failed') api.call('sendMessage', { chat_id: cq.message.chat.id, reply_parameters: { message_id: cq.message.message_id, allow_sending_without_reply: true }, text: yn === 'y' ? (out.status === 'executed' ? `✅ Aprobada por ${person?.name || admin?.name || who} y ejecutada.` : `⚠️ Aprobada pero falló: ${out.error}`) : `❌ Rechazada por ${person?.name || admin?.name || who}. Lo tendrá en cuenta para la próxima.` }).catch(() => {});
     return;
   }
   const r = await resolveCallback(bot._id, cq.data);

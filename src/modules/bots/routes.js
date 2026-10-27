@@ -39,9 +39,12 @@ r.post('/', validate(z.object({ name: z.string().min(2).max(60), kind: z.enum(['
   await assertLimit(tenantId, 'bots', await Bot.countDocuments({ tenantId }));
   const web = req.body.kind === 'web'; const worker = req.body.kind === 'worker';
   const role = ROLES[req.body.role] || ROLES.personalizado;
-  const bot = await Bot.create({ tenantId, name: req.body.name, kind: req.body.kind, status: web || worker ? 'active' : 'paused', ai: { provider: 'anthropic', model: defaultModel('anthropic') },
+  // Empleados digitales: informes multi-registro y varios pasos de consulta por tarea → necesitan bastante más
+  // margen que un bot conversacional. 1500/8 (lo que usa Telegram/web) les corta los informes a mitad de frase.
+  const bot = await Bot.create({ tenantId, name: req.body.name, kind: req.body.kind, status: web || worker ? 'active' : 'paused',
+    ai: { provider: 'anthropic', model: defaultModel('anthropic'), ...(worker ? { maxTokens: 8000, maxToolSteps: 16 } : {}) },
     ...(web ? { web: { publicKey: `ja_pk_${randomToken(18)}`, appearance: { title: req.body.name }, voice: { enabled: true, mode: 'browser' } } } : {}),
-    ...(worker ? { systemPrompt: '', worker: { role: req.body.role || 'personalizado', title: role.title, mission: role.mission, responsibilities: role.responsibilities, kpis: role.kpis, knowledge: { instructions: '', examples: [] }, memory: [],
+    ...(worker ? { systemPrompt: '', worker: { role: req.body.role || 'personalizado', title: role.title, mission: role.mission, responsibilities: role.responsibilities, kpis: role.kpis, knowledge: { instructions: '', examples: [] }, memory: [], blueprint: {},
       autonomy: { preset: role.preset, policy: AUTONOMY_PRESETS[role.preset].policy } } } : {}) });
   if (worker) for (const rt of role.routines) await syncRoutine(await WorkerRoutine.create({ ...rt, tenantId, botId: bot._id, enabled: false })); // creadas en pausa: el cliente las revisa y las activa
   audit(req, 'bot.create', { kind: 'bot', id: bot.id }); emitPlatformEvent('bot.created', { botId: bot.id, tenantId: String(tenantId), name: bot.name });

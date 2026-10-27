@@ -18,11 +18,12 @@ server.listen(env.PORT, () => logger.info(`API escuchando en :${env.PORT}`));
 
 // Apagado ordenado: deja de aceptar conexiones, termina las activas y cierra recursos
 let closing = false;
+export function closeApi() { return new Promise((resolve) => server.close(() => resolve())); }
 async function shutdown(sig) {
   if (closing) return; closing = true;
   logger.info({ sig }, 'Cerrando API…');
   server.close(async () => { await disconnectDB(); await redis.quit(); process.exit(0); });
   setTimeout(() => process.exit(1), 15000).unref();
 }
-['SIGTERM', 'SIGINT'].forEach((s) => process.on(s, () => shutdown(s)));
+if (!process.env.ALL_IN_ONE) ['SIGTERM', 'SIGINT'].forEach((s) => process.on(s, () => shutdown(s)));
 process.on('unhandledRejection', (err) => logger.error({ err }, 'unhandledRejection'));

@@ -41,11 +41,23 @@ await Q.maintenance.upsertJobScheduler('session-expiry-notices', { pattern: '0 9
 await Q.workers.upsertJobScheduler('approval-timeouts', { every: 15 * 60 * 1000 }, { name: 'approval-timeouts' });
 await Q.workflows.upsertJobScheduler('crm-date-scan', { every: 10 * 60 * 1000 }, { name: 'date-scan' });
 await Q.maintenance.upsertJobScheduler('model-check', { pattern: '0 6 * * *', tz: 'Europe/Madrid' }, { name: 'model-check' });
+// Las programaciones viven en Redis: si Redis se reinició sin persistencia (p. ej. plan gratuito), se reconstruyen desde Mongo
+try {
+  const { WorkerRoutine, Task } = await import('./models/index.js');
+  const { syncRoutine } = await import('./modules/worker/engine.js');
+  const { syncTask } = await import('./modules/tasks/scheduler.js');
+  const routines = await WorkerRoutine.find({ enabled: true }).lean(); for (const r of routines) await syncRoutine(r).catch(() => {});
+  const { Bot: BotM } = await import('./models/index.js'); const { syncHeartbeat } = await import('./modules/worker/engine.js');
+  for (const b of await BotM.find({ kind: 'worker', 'worker.proactive.enabled': true }).lean()) await syncHeartbeat(b).catch(() => {});
+  const tasks = await Task.find({ enabled: true }).lean(); for (const t of tasks) await syncTask(t).catch(() => {});
+  logger.info({ routines: routines.length, tasks: tasks.length }, 'Programaciones sincronizadas');
+} catch (err) { logger.warn({ err }, 'No se pudieron sincronizar las programaciones'); }
 logger.info('Workers en marcha');
 
+export async function closeWorkers() { await Promise.all(workers.map((w) => w.close())); }
 async function shutdown() {
   logger.info('Cerrando workers (terminando jobs activos)…');
-  await Promise.all(workers.map((w) => w.close()));
+  await closeWorkers();
   await disconnectDB(); process.exit(0);
 }
-process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
+if (!process.env.ALL_IN_ONE) { process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown); }

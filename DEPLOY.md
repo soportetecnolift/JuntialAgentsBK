@@ -29,3 +29,14 @@ Usa **subdominios del mismo dominio**: las cookies de sesión son *same-site* y 
 3. Agentes web: añade los dominios definitivos en *Instalar → Dominios autorizados*. El `<script>` del widget ahora carga desde `https://api.tudominio.com/widget/v1/widget.js`.
 4. Claude o ChatGPT: vuelve a conectar el MCP con `https://api.tudominio.com/mcp`.
 5. Comprueba que `https://api.tudominio.com/healthz` responde.
+
+## Opción gratuita (para empezar o probar)
+- **Render**: *Blueprint* `render.free.yaml`, con un Web Service gratuito que ejecuta API y worker juntos (`node src/all.js`) y un Key Value gratuito.
+- **Vercel Hobby** para el panel y **MongoDB Atlas M0** para la base de datos.
+- **Evitar que se duerma**: en https://cron-job.org crea una tarea `GET https://<tu-servicio>/healthz` cada 10 minutos. Las 750 h gratuitas al mes cubren un servicio 24/7.
+- **Limitaciones**:
+  - Render puede reiniciar las instancias gratuitas en cualquier momento.
+  - El Key Value gratuito no guarda en disco: las rutinas y tareas se reprograman solas al arrancar, pero se pierden los seguimientos o acciones con retardo pendientes.
+  - 512 MB de RAM.
+  - Vercel Hobby es para uso no comercial.
+- **Para pasar a producción** basta con cambiar al `render.yaml` normal (API y worker separados, Starter). No hay que tocar el código.

@@ -293,3 +293,27 @@ src/
   jobs/         tareas, webhooks entrantes, email, mantenimiento
   models/       esquemas Mongoose con índices y TTL
 ```
+
+
+## Empleado digital: equipo, canales, proactividad y memoria de trabajo
+- **Estilo:** cada tarea termina con `<aviso>` (corto, tipo WhatsApp, máximo 6 líneas, lo que llega por Telegram o email) y un `<detalle>` opcional que solo se ve en el panel (`WorkerRun.detail`). En el chat responde como un compañero. Estilo configurable: `worker.style` = `corto` o `detallado`.
+- **Actúa en vez de describir:** si algo se arregla con un cambio, usa la herramienta y el sistema crea la aprobación sola. Las aprobaciones llegan como pregunta directa, con el motivo en una frase.
+- **Memoria de trabajo:**
+  - `worker.threads` son los pendientes abiertos y cerrados. Se gestionan con la herramienta `track` y aparecen en cada prompt.
+  - `worker.journal` es una línea por tarea o conversación, para recordar lo que ha ido haciendo.
+- **Equipo** (`worker.people`): nombre, puesto, relación, email, Telegram, si puede aprobar y notas. Sirve para identificar quién habla en cada canal y para avisar a alguien con `message_person`, que elige su canal: Telegram si ya escribió al bot, si no, email.
+- **Canales para hablar con él:**
+  - **Telegram** (`worker.channels.telegramChat`): el bot de informes responde como el empleado si le escribe alguien del equipo o el chat de informes. Aprende solo el chat de cada persona.
+  - **Página personal** `GET /w/<enlace>`: chat tipo WhatsApp sin iniciar sesión, con un enlace por persona en la colección `WorkerLink`, revocable.
+  - **API/webhook** `POST /v1/bots/:id/worker/message` `{ text, from: { email | telegram | name }, conversation? }` → `{ reply }`.
+- **Aprobar hablando:** solo quien tiene `canApprove` (o un usuario del panel) puede decidir conversando. Quien no puede aprobar no ve esa opción.
+- **Proactivo** (`worker.proactive`): un latido cada N horas, en horario laboral, que repasa sus pendientes (los vencidos primero), recuerda las aprobaciones de más de 20 horas y avisa solo si hay algo que hacer (`[SIN_NOVEDADES]` en caso contrario).
+
+### Varios aprobadores (sin política de Juntial Center)
+- Las personas del equipo con `canApprove` son los **aprobadores**. Cada una recibe la solicitud **a su nombre**: por Telegram privado con botones, si ya escribió al bot, o por email con un **enlace personal** (`personTokens`).
+- **Regla** `worker.approvalRule`: `any` (basta uno), `all` (todos) o `quorum` (un mínimo). Los votos necesarios se guardan en la aprobación al crearla (`need`).
+- **Votos** `WorkerApproval.votes`: uno por persona, con nombre y canal. Un rechazo lo para al momento. Los votos parciales se comunican en todos los chats («Antonio ha aprobado (1/2)»).
+- `onlyApprovers` (activo por defecto): nadie más puede decidir, aunque esté en el chat de informes o tenga un email reenviado. Con aprobadores definidos no se envía el enlace compartido a los emails de informes. Los administradores de la organización deciden siempre: desde el panel, o por Telegram si lo tienen vinculado en Center.
+- Al decidirse, se cierran los botones de **todos** los mensajes de Telegram de esa aprobación (`tgMessages`).
+- Sin aprobadores en el equipo, funciona como antes: decide cualquiera del chat de informes o quien tenga el enlace.
+- Todos los canales (Telegram, enlace personal, chat, webhook con `decidedBy`) pasan por `voteApproval()`.

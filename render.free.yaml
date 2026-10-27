@@ -1,0 +1,67 @@
+# Blueprint GRATUITO de Render: un único Web Service gratuito (API + worker en el mismo proceso) + Key Value gratuito.
+# Render → New → Blueprint → elige el repo → en «Blueprint Path» escribe: render.free.yaml
+# Limitaciones del plan gratuito: se duerme tras 15 min sin tráfico (evítalo con un ping cada 10 min, ver DEPLOY.md),
+# 512 MB de RAM, y el Key Value gratuito (25 MB) no guarda en disco: al reiniciarse se reprograman solas
+# las rutinas y tareas, pero se pierden los seguimientos/acciones con retardo que estuvieran pendientes.
+services:
+  - type: keyvalue
+    name: juntial-redis
+    region: frankfurt
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+  - type: web
+    name: juntial
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/all.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_POOL
+        value: "10"
+      - key: LOG_LEVEL
+        value: info
+      - key: STAFF_MFA_REQUIRED
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: lax
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: juntial-redis
+          property: connectionString
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: WEB_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: COOKIE_DOMAIN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: SUPERADMIN_EMAIL
+        sync: false

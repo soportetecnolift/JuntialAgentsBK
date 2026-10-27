@@ -1,6 +1,7 @@
+import { env } from '../../config/env.js';
 import { Router } from 'express';
 import { z } from 'zod';
-import { Bot, WorkerRoutine, WorkerDoc, WorkerRun, WorkerApproval, WorkerMessage, WorkerFile, daysFromNow } from '../../models/index.js';
+import { Bot, WorkerRoutine, WorkerDoc, WorkerRun, WorkerApproval, WorkerMessage, WorkerFile, WorkerLink, daysFromNow } from '../../models/index.js';
 import { storeDocument, analyzeDocument, MAX_BYTES } from './documents.js';
 import { getBotRuntime } from '../../telegram/runtime.js';
 import { asyncH, notFound, badRequest } from '../../lib/errors.js';
@@ -17,6 +18,8 @@ import { validateCron } from '../tasks/scheduler.js';
 import { ROLES, AUTONOMY_PRESETS, CATEGORIES } from './roles.js';
 import { chunkText, htmlToText } from './knowledge.js';
 import { runWorker, decideApproval, syncRoutine, categorize, policyFor, sendTestApproval } from './engine.js';
+import { renderBlueprint, blueprintCompleteness, BLUEPRINT_SECTIONS } from './blueprint.js';
+import { runOnboardingCheck, saveOnboardingResult } from './onboarding.js';
 
 /** Panel del empleado digital: /api/bots/:botId/worker/* */
 const r = Router({ mergeParams: true });
@@ -36,6 +39,10 @@ r.put('/', validate(z.object({
     workingHours: z.object({ enabled: z.boolean(), start: z.string().regex(/^\d{2}:\d{2}$/), end: z.string().regex(/^\d{2}:\d{2}$/), days: z.array(z.number().int().min(0).max(6)), tz: z.string() }).partial(),
   }).partial(),
   departmentId: z.string().nullable(),
+  proactive: z.object({ enabled: z.boolean(), everyHours: z.number().min(1).max(24) }).partial(),
+  channels: z.object({ telegramChat: z.boolean(), pages: z.boolean(), api: z.boolean() }).partial(),
+  style: z.enum(['corto', 'detallado']),
+  approvalRule: z.object({ mode: z.enum(['any', 'all', 'quorum']), quorum: z.number().int().min(1).max(20), onlyApprovers: z.boolean() }).partial(),
   reporting: z.object({
     telegramBotId: z.string().nullable(), chatId: z.number().nullable(), notifyPanel: z.boolean(), onlyWhenRelevant: z.boolean(),
     email: z.object({ enabled: z.boolean(), to: z.array(z.string().email()).max(10), events: z.array(z.enum(['approvals', 'reports', 'questions'])) }).partial(),
@@ -47,6 +54,7 @@ r.put('/', validate(z.object({
   b.worker = {
     ...w, ...(body.departmentId !== undefined ? { departmentId: body.departmentId || undefined } : {}), ...['title', 'mission', 'responsibilities', 'kpis', 'paused'].reduce((o, k) => (body[k] !== undefined ? { ...o, [k]: body[k] } : o), {}),
     knowledge: { ...w.knowledge, ...body.knowledge },
+    approvalRule: { ...w.approvalRule, ...body.approvalRule }, proactive: { ...w.proactive, ...body.proactive }, channels: { ...w.channels, ...body.channels }, ...(body.style ? { style: body.style } : {}),
     documents: { ...w.documents, ...body.documents },
     autonomy: { ...w.autonomy, ...body.autonomy, policy: { ...w.autonomy?.policy, ...body.autonomy?.policy }, workingHours: { ...w.autonomy?.workingHours, ...body.autonomy?.workingHours }, toolOverrides: body.autonomy?.toolOverrides ?? w.autonomy?.toolOverrides },
     reporting: { ...w.reporting, ...body.reporting,
@@ -56,8 +64,73 @@ r.put('/', validate(z.object({
       webhook: { ...w.reporting?.webhook, ...body.reporting?.webhook, secretEnc: w.reporting?.webhook?.secretEnc || (body.reporting?.webhook?.enabled ? encrypt(`whsec_${randomToken(24)}`) : undefined) } },
   };
   b.markModified('worker'); await done(b); audit(req, 'worker.update', { kind: 'bot', id: b.id }, { fields: Object.keys(body) });
+  if (body.proactive) { const { syncHeartbeat } = await import('./engine.js'); await syncHeartbeat(b.toObject()); }
   const out = b.toObject(); if (out.worker?.reporting?.webhook) delete out.worker.reporting.webhook.secretEnc; res.json(out);
 }));
+
+/* Equipo: compañeros y colaboradores del empleado, con sus canales */
+const personSchema = z.object({
+  _id: z.string().optional(), name: z.string().min(1).max(80), role: z.string().max(80).optional().default(''),
+  relation: z.enum(['responsable', 'compañero', 'colaborador', 'externo']).default('compañero'),
+  email: z.string().email().or(z.literal('')).optional(), telegramUsername: z.string().max(40).optional().default(''), telegramChatId: z.number().nullable().optional(),
+  phone: z.string().max(30).optional().default(''), canApprove: z.boolean().default(false), notes: z.string().max(400).optional().default(''),
+});
+r.get('/people', asyncH(async (req, res) => {
+  const b = await find(req); const links = await WorkerLink.find({ botId: b._id }).select('personId lastUsedAt').lean();
+  res.json((b.worker?.people || []).map((p) => { const o = p.toObject ? p.toObject() : p; const l = links.find((x) => String(x.personId) === String(o._id)); return { ...o, hasLink: !!l, linkLastUsedAt: l?.lastUsedAt }; }));
+}));
+r.put('/people', validate(z.object({ people: z.array(personSchema).max(100) })), asyncH(async (req, res) => {
+  const b = await find(req);
+  b.worker.people = req.body.people.map((p) => ({ ...p, email: p.email || undefined, telegramUsername: (p.telegramUsername || '').replace(/^@/, '').toLowerCase() || undefined, telegramChatId: p.telegramChatId || undefined }));
+  b.markModified('worker'); await done(b);
+  const ids = new Set(b.worker.people.map((p) => String(p._id))); await WorkerLink.deleteMany({ botId: b._id, personId: { $nin: [...ids] } });
+  audit(req, 'worker.people.update', { kind: 'bot', id: b.id }, { count: b.worker.people.length }); res.json(b.worker.people);
+}));
+r.post('/people/:pid/link', asyncH(async (req, res) => {
+  const b = await find(req); if (!(b.worker?.people || []).some((p) => String(p._id) === req.params.pid)) throw notFound('Persona');
+  const { createPersonLink } = await import('./conversation.js'); const raw = await createPersonLink(b, req.params.pid);
+  audit(req, 'worker.people.link', { kind: 'bot', id: b.id }); res.json({ url: `${env.PUBLIC_API_URL}/w/${raw}` });
+}));
+r.delete('/people/:pid/link', asyncH(async (req, res) => { const b = await find(req); await WorkerLink.deleteMany({ botId: b._id, personId: req.params.pid }); res.json({ ok: true }); }));
+
+/* Memoria de trabajo: pendientes abiertos y diario */
+r.get('/memory/work', asyncH(async (req, res) => { const b = await find(req); res.json({ threads: (b.worker?.threads || []).slice(-100).reverse(), journal: (b.worker?.journal || []).slice(-60).reverse() }); }));
+r.post('/threads/:tid/close', asyncH(async (req, res) => {
+  const b = await find(req); await Bot.updateOne({ _id: b._id, 'worker.threads._id': req.params.tid }, { $set: { 'worker.threads.$.status': 'done', 'worker.threads.$.closedAt': new Date(), 'worker.threads.$.note': `Cerrado por ${req.user.email}` } }); res.json({ ok: true });
+}));
+
+/* Hablar con el empleado por API / webhook (respuesta en la misma llamada). Útil desde Make, n8n, un ERP… */
+r.post('/message', validate(z.object({ text: z.string().min(1).max(8000), from: z.object({ name: z.string().max(80), email: z.string().email(), telegram: z.string().max(40) }).partial().default({}), conversation: z.string().max(80).optional() })), asyncH(async (req, res) => {
+  const b = await find(req); if (b.worker?.channels?.api === false) throw badRequest('La API de conversación está desactivada para este empleado');
+  const { identifyPerson, talkToWorker } = await import('./conversation.js');
+  const person = identifyPerson(b.toObject(), { email: req.body.from.email, telegramUsername: req.body.from.telegram });
+  const conv = `api:${req.body.conversation || person?._id || req.body.from.email || req.body.from.name || 'anon'}`;
+  const out = await talkToWorker(b._id, { text: req.body.text, person, channel: 'api', conv, fromName: req.body.from.name });
+  res.json({ reply: out.reply, runId: out.runId, person: person ? { id: person._id, name: person.name, canApprove: person.canApprove } : null });
+}));
+
+/* El «guion»: configurador estructurado del manual, por secciones en vez de texto libre */
+r.get('/blueprint/meta', asyncH(async (_req, res) => res.json({ sections: BLUEPRINT_SECTIONS })));
+const blueprintSchema = z.object({
+  context: z.string().max(4000), autonomyNotes: z.string().max(4000), reportFormat: z.string().max(2000), queryHints: z.string().max(4000), notes: z.string().max(6000),
+  stateField: z.string().max(80), allStateValues: z.string().max(3000), completionRule: z.string().max(1000), automations: z.string().max(4000), dataQuirks: z.string().max(4000),
+  variants: z.array(z.object({ name: z.string().min(1).max(80), rule: z.string().min(1).max(1000) })).max(20),
+  stages: z.array(z.object({ from: z.string().min(1).max(80), to: z.string().min(1).max(80), requirement: z.string().min(1).max(1000) })).max(40),
+  priorities: z.array(z.string().max(300)).max(15),
+}).partial();
+r.get('/blueprint', asyncH(async (req, res) => { const b = await find(req); const bp = b.worker?.blueprint?.toObject ? b.worker.blueprint.toObject() : (b.worker?.blueprint || {}); res.json({ blueprint: bp, completeness: blueprintCompleteness(bp), preview: renderBlueprint(bp) }); }));
+r.put('/blueprint', validate(blueprintSchema), asyncH(async (req, res) => {
+  const b = await find(req); const bp = { ...(b.worker.blueprint?.toObject ? b.worker.blueprint.toObject() : b.worker.blueprint || {}), ...req.body };
+  b.worker.blueprint = bp; b.worker.knowledge = { ...b.worker.knowledge, instructions: renderBlueprint(bp) };
+  b.markModified('worker'); await done(b); audit(req, 'worker.blueprint.update', { kind: 'bot', id: b.id });
+  res.json({ blueprint: bp, completeness: blueprintCompleteness(bp), preview: renderBlueprint(bp) });
+}));
+
+/* Puesta a punto: verifica contra el conector real qué campos del manual existen de verdad, antes de confiar en el empleado sin supervisión */
+r.post('/onboarding/check', asyncH(async (req, res) => {
+  const b = await find(req); const result = await runOnboardingCheck(b._id); await saveOnboardingResult(b._id, result); res.json(result);
+}));
+r.get('/onboarding', asyncH(async (req, res) => { const b = await find(req); res.json(b.worker?.onboarding || null); }));
 
 /* Canales: secreto del webhook y prueba de entrega */
 r.get('/reporting/webhook-secret', asyncH(async (req, res) => { const b = await find(req, SECRET); res.json({ secret: decrypt(b.worker?.reporting?.webhook?.secretEnc) || null }); }));
@@ -202,7 +275,7 @@ r.post('/chat', validate(z.object({ text: z.string().min(1).max(8000) })), async
   const ac = new AbortController(); res.on('close', () => { if (!res.writableEnded) ac.abort(); });
   const emit = (e, d) => { if (!res.writableEnded) res.write(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`); };
   try {
-    const out = await runWorker({ botId: b._id, trigger: { type: 'chat', label: `Conversación con ${req.user.email}` }, instruction: req.body.text, chatHistory: hist,
+    const out = await runWorker({ botId: b._id, trigger: { type: 'chat', label: `Conversación con ${req.user.email}` }, instruction: req.body.text, chatHistory: hist, actor: { userId: req.user.id, email: req.user.email, name: req.user.name || req.user.email, canApprove: true },
       onText: (t) => emit('delta', { text: t }), onStep: (s) => emit('step', { kind: s.kind, name: s.name, category: s.category, result: s.result }), signal: ac.signal });
     const text = out.text || out.skipped || '';
     await WorkerMessage.create({ botId: b._id, role: 'assistant', text, runId: out.run?._id, expiresAt: daysFromNow(90) });

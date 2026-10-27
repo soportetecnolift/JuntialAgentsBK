@@ -1,0 +1,22 @@
+# Sustituye juntial.duckdns.org por tu dominio. Caddy obtiene el certificado HTTPS solo (Let's Encrypt).
+juntial.duckdns.org {
+	encode gzip
+
+	# API: todo lo que necesita el backend
+	@api path /api/* /v1/* /tg/* /widget/* /mcp* /oauth/* /.well-known/* /a/* /w/* /hooks/* /healthz /docs /openapi.json
+	handle @api {
+		reverse_proxy 127.0.0.1:4000
+	}
+
+	# Panel (React): solo si lo compilaste con `npm run build` (ver README, paso 5)
+	handle {
+		root * C:\juntial\juntialagents-frontend\dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+}
